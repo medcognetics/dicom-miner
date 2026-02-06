@@ -1,0 +1,52 @@
+version: 2.1
+
+jobs:
+    quality:
+        docker:
+            - image: rust:latest
+        steps:
+            - checkout
+            - run:
+                name: Install dependencies
+                command: rustup component add rustfmt clippy
+            - run:
+                name: Check formatting
+                command: cargo fmt -- --check
+            - run:
+                name: General check
+                command: cargo check --all-features
+            - run:
+                name: Clippy check
+                command: cargo clippy --all-features -- -D warnings
+
+    build:
+        docker:
+            - image: rust:latest
+        steps:
+            - checkout
+            - restore_cache:
+                key: project-cache
+            - run:
+                name: Install dependencies
+                command: rustup component add rustfmt
+            - run:
+                name: Stable Build
+                command: cargo build
+            - run:
+                name: Test
+                command: cargo test
+            - save_cache:
+                key: project-cache
+                paths:
+                - "~/.cargo"
+                - "./target"
+            - persist_to_workspace:
+                root: .
+                paths:
+                    - target/
+
+workflows:
+    build_and_test:
+        jobs:
+            - quality
+            - build
