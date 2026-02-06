@@ -2,29 +2,30 @@
 name = "dicom-miner"
 version = "0.1.0"
 edition = "2021"
+rust-version = "1.85"
 
 [dependencies]
-dicom = "0.7.0"
-dicom-json = "0.7.0"
-serde_json = "1.0"
-arrow = "51.0.0"
-parquet = { version = "51.0.0", features = ["arrow", "async", "zstd"] }
-crossbeam-channel = "0.5"
-indicatif = { version = "0.17", features = ["rayon"] }
-clap = { version = "4.5", features = ["derive"] }
-rayon = "1.10"
-rust_search = "2.1"
-log = "0.4"
-thiserror = "1.0"
-env_logger = "0.11"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
-snafu = "0.8"
-chrono = "=0.4.38"
+dicom = "0.9.0"
+dicom-json = "0.9.0"
+serde_json = "1.0.149"
+arrow = "57.2.0"
+parquet = { version = "57.2.0", features = ["arrow", "async", "zstd"] }
+crossbeam-channel = "0.5.15"
+indicatif = { version = "0.18.3", features = ["rayon"] }
+clap = { version = "4.5.57", features = ["derive"] }
+rayon = "1.11.0"
+rust_search = "2.1.0"
+log = "0.4.29"
+thiserror = "2.0.18"
+env_logger = "0.11.8"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+snafu = "0.8.9"
+chrono = "0.4.43"
 
 [dev-dependencies]
-tempfile = "3.10"
-dicom-test-files = "0.3"
-rstest = "0.19"
+tempfile = "3.24.0"
+dicom-test-files = "0.3.1"
+rstest = "0.26.1"
 
 [[bin]]
 name = "dicom-miner"

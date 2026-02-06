@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::Error;
 use std::os::unix::fs::MetadataExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::thread;
 use std::time::Instant;
@@ -33,8 +33,6 @@ enum AggregateError {
     Io(#[from] Error),
     #[error("Core error: {0}")]
     Core(#[from] dicom_miner::error::Error),
-    #[error("Other error: {0}")]
-    Other(String),
 }
 
 /// Find the files to be processed with a progress bar
@@ -76,14 +74,14 @@ fn sort_by_inode(files: Vec<PathBuf>) -> Vec<PathBuf> {
 
 /// Get the path to a shard file
 #[inline]
-fn shard_path(path: &PathBuf, index: usize) -> PathBuf {
+fn shard_path(path: &Path, index: usize) -> PathBuf {
     let shard_extension = format!("{:05}.parquet", index);
     path.with_extension("").with_extension(shard_extension)
 }
 
 /// Opens a new shard file
 #[inline]
-fn open_output_shard(path: &PathBuf, index: usize) -> Result<File, dicom_miner::error::Error> {
+fn open_output_shard(path: &Path, index: usize) -> Result<File, dicom_miner::error::Error> {
     let shard_path = shard_path(path, index);
     File::create(shard_path).map_err(|e| dicom_miner::error::Error::Whatever {
         message: format!("Failed to create output file: {}", e),
@@ -92,9 +90,10 @@ fn open_output_shard(path: &PathBuf, index: usize) -> Result<File, dicom_miner::
 }
 
 /// Convert DICOM files to RecordBatches and stream to shard writers
+#[allow(clippy::too_many_arguments)]
 fn convert_and_aggregate_dicoms(
     dicom_paths: &[PathBuf],
-    output_path: &PathBuf,
+    output_path: &Path,
     unified_schema: &arrow::datatypes::Schema,
     header_only: bool,
     hash_pixel_data: bool,
@@ -120,7 +119,7 @@ fn convert_and_aggregate_dicoms(
 
     // Receiver thread (shard writer)
     let schema_clone = unified_schema.clone();
-    let output_path_clone = output_path.clone();
+    let output_path_clone = output_path.to_path_buf();
     let receiver_thread = thread::spawn(move || {
         let mut shard_idx = 0;
         let mut shards = vec![shard_path(&output_path_clone, shard_idx)];
@@ -198,7 +197,7 @@ fn convert_and_aggregate_dicoms(
             // Apply tag overrides
             if let Some(overrides) = overrides {
                 for (tag, value) in overrides {
-                    if let Some(dict_entry) = StandardDataDictionary::default().by_name(tag) {
+                    if let Some(dict_entry) = StandardDataDictionary.by_name(tag) {
                         let tag = dict_entry.tag();
                         dicom.put(DataElement::new(tag, VR::LO, value.to_string()));
                     }
@@ -358,7 +357,7 @@ fn run(args: Args) -> Result<Vec<PathBuf>, AggregateError> {
 
     // Phase 3: Convert and aggregate (streaming)
     info!("Converting DICOM files and writing to Parquet shards...");
-    let overrides = HashMap::from_iter(args.tags.into_iter());
+    let overrides = HashMap::from_iter(args.tags);
     let overrides = if overrides.is_empty() {
         None
     } else {

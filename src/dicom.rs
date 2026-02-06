@@ -87,8 +87,8 @@ pub fn hash_pixel_data(dcm: &InMemDicomObject) -> Result<u64, Box<dyn std::error
     let element = dcm.element(tags::PIXEL_DATA)?;
     match element.value() {
         DicomValue::PixelSequence(v) => {
-            // NOTE: Offset table isn't hashed, only 
-            let fragments = v.fragments().into_iter().map(|f| Cow::from(f));
+            // NOTE: Offset table isn't hashed, only fragments.
+            let fragments = v.fragments().iter().map(Cow::from);
             // Hash each fragment and sum with wrapping overflow
             let hash_sum = fragments.fold(0u64, |acc, f| acc.wrapping_add(xxh3_64_with_seed(&f, HASH_SEED)));
             Ok(hash_sum)

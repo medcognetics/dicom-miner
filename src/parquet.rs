@@ -250,7 +250,7 @@ impl FromDicom for ArrayRef {
         // Convert each sequence element to a JSON string
         let sub_jsons = seq
             .items()
-            .into_iter()
+            .iter()
             .map(DicomJson::from)
             .filter_map(|x| serde_json::to_value(&x).ok())
             .map(|x| x.to_string())
@@ -327,10 +327,10 @@ pub fn dicom_file_to_parquet(
         })?;
 
     // Add each tag string and value string to the DICOM
-    if overrides.is_some() {
-        for (tag, value) in overrides.unwrap() {
+    if let Some(overrides) = overrides {
+        for (tag, value) in overrides {
             // Map string tag to a tag enum
-            let tag = StandardDataDictionary::default()
+            let tag = StandardDataDictionary
                 .by_name(tag)
                 .ok_or(Error::TagNotFound {
                     tag_name: tag.to_string(),
@@ -384,9 +384,10 @@ pub fn dicom_to_parquet(
         .meta()
         .to_element_iter()
         .map(|e| e.into_parts())
-        .filter_map(|(header, value)| match value.into_primitive() {
-            Some(v) => Some(InMemElement::new(header.tag, header.vr(), v)),
-            None => None,
+        .filter_map(|(header, value)| {
+            value
+                .into_primitive()
+                .map(|v| InMemElement::new(header.tag, header.vr(), v))
         })
         .collect::<Vec<_>>();
 
@@ -412,15 +413,12 @@ pub fn dicom_to_parquet(
             header.tag != tags::SOP_INSTANCE_UID && header.tag != tags::STUDY_INSTANCE_UID;
 
         let field = DataType::from_dicom_element(element)
-            .and_then(|dtype| Some(Field::new(tag_name, dtype, nullable)));
+            .map(|dtype| Field::new(tag_name, dtype, nullable));
         let array = ArrayRef::from_dicom_element(element);
 
-        match (field, array) {
-            (Some(f), Some(a)) => {
-                fields.push(f);
-                arrays.push(a);
-            }
-            _ => {}
+        if let (Some(f), Some(a)) = (field, array) {
+            fields.push(f);
+            arrays.push(a);
         }
     }
 
@@ -521,9 +519,10 @@ pub fn extract_schema_from_dicom_header(
         .meta()
         .to_element_iter()
         .map(|e| e.into_parts())
-        .filter_map(|(header, value)| match value.into_primitive() {
-            Some(v) => Some(InMemElement::new(header.tag, header.vr(), v)),
-            None => None,
+        .filter_map(|(header, value)| {
+            value
+                .into_primitive()
+                .map(|v| InMemElement::new(header.tag, header.vr(), v))
         })
         .collect::<Vec<_>>();
 
@@ -550,7 +549,7 @@ pub fn extract_schema_from_dicom_header(
             header.tag != tags::SOP_INSTANCE_UID && header.tag != tags::STUDY_INSTANCE_UID;
 
         // Use FromDicom trait to get DataType WITHOUT creating arrays
-        if let Some(dtype) = DataType::from_dicom_element(&element) {
+        if let Some(dtype) = DataType::from_dicom_element(element) {
             fields.push(Field::new(tag_name, dtype, nullable));
         }
     }
@@ -672,9 +671,10 @@ pub fn dicom_to_record_batch(
         .meta()
         .to_element_iter()
         .map(|e| e.into_parts())
-        .filter_map(|(header, value)| match value.into_primitive() {
-            Some(v) => Some(InMemElement::new(header.tag, header.vr(), v)),
-            None => None,
+        .filter_map(|(header, value)| {
+            value
+                .into_primitive()
+                .map(|v| InMemElement::new(header.tag, header.vr(), v))
         })
         .collect::<Vec<_>>();
 
@@ -700,15 +700,12 @@ pub fn dicom_to_record_batch(
             header.tag != tags::SOP_INSTANCE_UID && header.tag != tags::STUDY_INSTANCE_UID;
 
         let field = DataType::from_dicom_element(element)
-            .and_then(|dtype| Some(Field::new(tag_name, dtype, nullable)));
+            .map(|dtype| Field::new(tag_name, dtype, nullable));
         let array = ArrayRef::from_dicom_element(element);
 
-        match (field, array) {
-            (Some(f), Some(a)) => {
-                fields.push(f);
-                arrays.push(a);
-            }
-            _ => {}
+        if let (Some(f), Some(a)) = (field, array) {
+            fields.push(f);
+            arrays.push(a);
         }
     }
 
@@ -784,7 +781,7 @@ pub fn cast_record_to_utf8_schema(
                 // Otherwise create a null array of the correct type
                 _ => Ok(arrow::array::new_null_array(
                     f.data_type(),
-                    record.num_rows() as usize,
+                    record.num_rows(),
                 )),
             }
         })
