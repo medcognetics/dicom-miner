@@ -90,14 +90,19 @@ pub fn hash_pixel_data(dcm: &InMemDicomObject) -> Result<u64, Box<dyn std::error
             // NOTE: Offset table isn't hashed, only fragments.
             let fragments = v.fragments().iter().map(Cow::from);
             // Hash each fragment and sum with wrapping overflow
-            let hash_sum = fragments.fold(0u64, |acc, f| acc.wrapping_add(xxh3_64_with_seed(&f, HASH_SEED)));
+            let hash_sum = fragments.fold(0u64, |acc, f| {
+                acc.wrapping_add(xxh3_64_with_seed(&f, HASH_SEED))
+            });
             Ok(hash_sum)
         }
         DicomValue::Primitive(v) => {
             let pixel_data = v.to_bytes();
             Ok(xxh3_64_with_seed(&pixel_data, HASH_SEED))
         }
-        _ => panic!("Should never encounter pixel data as something other than a primitive or pixel sequence"),
+        _ => Err(Box::new(Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Unsupported PixelData representation",
+        ))),
     }
 }
 
@@ -122,10 +127,12 @@ pub fn open_dicom(
             .element_opt(tags::PIXEL_DATA)
             .unwrap_or(None)
             .is_some_and(|v| !v.is_empty());
-        assert!(
-            !has_pixel_data,
-            "PixelData should not be present in the schema if header_only is true"
-        )
+        if has_pixel_data {
+            return Err(Error::new(
+                std::io::ErrorKind::InvalidData,
+                "PixelData should not be present when header_only is true",
+            ));
+        }
     }
     Ok(obj)
 }

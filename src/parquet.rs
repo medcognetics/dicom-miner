@@ -291,16 +291,14 @@ impl FromDicom for ArrayRef {
 
 /// Hashes pixel data if required and writes DICOM data to a Parquet file.
 ///
-/// This function reads a DICOM file from the specified `dicom_path`, extracts its metadata and data,
-/// and writes it to a Parquet file at the specified `parquet_path`. If `header_only` is set to true,
-/// only the metadata (header) of the DICOM file is written to the Parquet file. Otherwise, both the
-/// metadata and the data are written.
+/// This function reads a DICOM file from the specified `dicom_path`, extracts metadata fields,
+/// and writes them to a Parquet file at the specified `parquet_path`. PixelData is never written;
+/// if hashing is enabled, PixelData is only read to compute `PixelDataHash`.
 ///
 /// # Arguments
 ///
 /// * `dicom_path` - Path to the input DICOM file.
 /// * `parquet_path` - Path to the output Parquet file.
-/// * `header_only` - Boolean flag indicating whether to write only the metadata (header) or both metadata and data.
 /// * `hash_pixel_data` - Boolean flag indicating whether to hash the pixel data.
 /// * `overrides` - Optional hash map of tag names to values to override the original DICOM data.
 ///
@@ -315,16 +313,14 @@ impl FromDicom for ArrayRef {
 pub fn dicom_file_to_parquet(
     dicom_path: &Path,
     parquet_path: &Path,
-    header_only: bool,
     hash_pixel_data: bool,
     overrides: Option<&HashMap<String, String>>,
     snake_case: bool,
 ) -> Result<(), Error> {
-    let mut obj =
-        open_dicom(dicom_path, header_only && !hash_pixel_data).map_err(|e| Error::Whatever {
-            message: format!("Failed to open DICOM file: {}", e),
-            source: Some(Box::new(e)),
-        })?;
+    let mut obj = open_dicom(dicom_path, !hash_pixel_data).map_err(|e| Error::Whatever {
+        message: format!("Failed to open DICOM file: {}", e),
+        source: Some(Box::new(e)),
+    })?;
 
     // Add each tag string and value string to the DICOM
     if let Some(overrides) = overrides {
@@ -343,20 +339,18 @@ pub fn dicom_file_to_parquet(
         }
     }
 
-    dicom_to_parquet(&obj, parquet_path, header_only, hash_pixel_data, snake_case)
+    dicom_to_parquet(&obj, parquet_path, hash_pixel_data, snake_case)
 }
 
 /// Hashes pixel data if required and writes DICOM data to a Parquet file.
 ///
 /// This function processes the DICOM data provided, optionally hashes pixel data if specified,
-/// and writes the resulting data to a Parquet file. It handles both cases where only metadata
-/// is required or both metadata and pixel data are needed.
+/// and writes metadata fields to a Parquet file. PixelData is always excluded from output rows.
 ///
 /// # Arguments
 ///
 /// * `dicom` - A reference to the in-memory DICOM object.
 /// * `parquet_path` - The file path where the Parquet file will be saved.
-/// * `header_only` - If true, only DICOM headers are processed; otherwise, full data is processed.
 /// * `hash_pixel_data` - If true, pixel data is hashed for additional processing.
 /// * `snake_case` - If true, DICOM tag names are converted to snake case.
 ///
@@ -371,7 +365,6 @@ pub fn dicom_file_to_parquet(
 pub fn dicom_to_parquet(
     dicom: &FileDicomObject<InMemDicomObject>,
     parquet_path: &Path,
-    header_only: bool,
     hash_pixel_data: bool,
     snake_case: bool,
 ) -> Result<(), Error> {
@@ -395,7 +388,7 @@ pub fn dicom_to_parquet(
     let elements = dicom.into_iter().chain(meta_elems.iter());
     for element in elements {
         let (header, value) = (&element.header(), element.value());
-        if value.is_empty() || (header_only && header.tag == tags::PIXEL_DATA) {
+        if value.is_empty() || header.tag == tags::PIXEL_DATA {
             continue;
         }
 
@@ -443,14 +436,18 @@ pub fn dicom_to_parquet(
         }
     }
 
-    fields.iter().zip(arrays.iter()).for_each(|(field, array)| {
-        assert!(
-            array.len() == 1,
-            "Array {} should have length 1, found {}",
-            field.name(),
-            array.len()
-        );
-    });
+    for (field, array) in fields.iter().zip(arrays.iter()) {
+        if array.len() != 1 {
+            return Err(Error::Whatever {
+                message: format!(
+                    "Array {} should have length 1, found {}",
+                    field.name(),
+                    array.len()
+                ),
+                source: None,
+            });
+        }
+    }
 
     // Create schema
     let schema = Arc::new(Schema::new(fields));
@@ -584,6 +581,7 @@ pub fn create_unified_schema_from_dicoms(
     dicom_paths: &[PathBuf],
     snake_case: bool,
     hash_pixel_data: bool,
+    strict: bool,
 ) -> Result<Schema, Error> {
     if dicom_paths.is_empty() {
         return Err(Error::Whatever {
@@ -592,19 +590,26 @@ pub fn create_unified_schema_from_dicoms(
         });
     }
 
-    // Parallel schema extraction from DICOM headers
-    let schemas: Vec<Schema> = dicom_paths
-        .par_iter()
-        .filter_map(|path| {
-            match extract_schema_from_dicom_header(path, snake_case, hash_pixel_data) {
-                Ok(s) => Some(s),
-                Err(e) => {
-                    warn!("Failed to extract schema from {}: {}", path.display(), e);
-                    None
+    // Parallel schema extraction from DICOM headers.
+    let schemas: Vec<Schema> = if strict {
+        dicom_paths
+            .par_iter()
+            .map(|path| extract_schema_from_dicom_header(path, snake_case, hash_pixel_data))
+            .collect::<Result<Vec<_>, _>>()?
+    } else {
+        dicom_paths
+            .par_iter()
+            .filter_map(|path| {
+                match extract_schema_from_dicom_header(path, snake_case, hash_pixel_data) {
+                    Ok(s) => Some(s),
+                    Err(e) => {
+                        warn!("Failed to extract schema from {}: {}", path.display(), e);
+                        None
+                    }
                 }
-            }
-        })
-        .collect();
+            })
+            .collect()
+    };
 
     if schemas.is_empty() {
         return Err(Error::Whatever {
@@ -649,7 +654,6 @@ pub fn create_unified_schema_from_dicoms(
 /// # Arguments
 ///
 /// * `dicom` - Reference to the in-memory DICOM object
-/// * `header_only` - If true, only DICOM headers are processed; otherwise, full data is processed
 /// * `hash_pixel_data` - If true, pixel data is hashed for additional processing
 /// * `snake_case` - If true, DICOM tag names are converted to snake case
 ///
@@ -658,7 +662,6 @@ pub fn create_unified_schema_from_dicoms(
 /// * `Result<RecordBatch, Error>` - Single-row RecordBatch containing DICOM data
 pub fn dicom_to_record_batch(
     dicom: &FileDicomObject<InMemDicomObject>,
-    header_only: bool,
     hash_pixel_data: bool,
     snake_case: bool,
 ) -> Result<RecordBatch, Error> {
@@ -682,7 +685,7 @@ pub fn dicom_to_record_batch(
     let elements = dicom.into_iter().chain(meta_elems.iter());
     for element in elements {
         let (header, value) = (&element.header(), element.value());
-        if value.is_empty() || (header_only && header.tag == tags::PIXEL_DATA) {
+        if value.is_empty() || header.tag == tags::PIXEL_DATA {
             continue;
         }
 
@@ -730,14 +733,18 @@ pub fn dicom_to_record_batch(
         }
     }
 
-    fields.iter().zip(arrays.iter()).for_each(|(field, array)| {
-        assert!(
-            array.len() == 1,
-            "Array {} should have length 1, found {}",
-            field.name(),
-            array.len()
-        );
-    });
+    for (field, array) in fields.iter().zip(arrays.iter()) {
+        if array.len() != 1 {
+            return Err(Error::Whatever {
+                message: format!(
+                    "Array {} should have length 1, found {}",
+                    field.name(),
+                    array.len()
+                ),
+                source: None,
+            });
+        }
+    }
 
     // Create schema and RecordBatch
     let schema = Arc::new(Schema::new(fields));
@@ -787,12 +794,16 @@ pub fn cast_record_to_utf8_schema(
         })
         .collect::<Result<Vec<_>, _>>()?;
 
-    assert!(
-        casted_columns.len() == schema.fields().len(),
-        "Casted column count {} should match schema column count: {}",
-        casted_columns.len(),
-        schema.fields().len()
-    );
+    if casted_columns.len() != schema.fields().len() {
+        return Err(Error::Whatever {
+            message: format!(
+                "Casted column count {} should match schema column count {}",
+                casted_columns.len(),
+                schema.fields().len()
+            ),
+            source: None,
+        });
+    }
 
     let batch = RecordBatch::try_new(Arc::new(schema.clone()), casted_columns).map_err(|e| {
         Error::Whatever {
@@ -805,17 +816,14 @@ pub fn cast_record_to_utf8_schema(
 
 #[cfg(test)]
 mod tests {
-    use arrow::array::{BinaryArray, StringArray, UInt64Array};
-
-    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
-
+    use arrow::array::{StringArray, UInt64Array};
     use dicom::object::OpenFileOptions;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use rstest::rstest;
     use std::collections::HashMap;
-
-    use super::{dicom_file_to_parquet, snake_case};
-
     use std::fs::File;
+
+    use super::{create_unified_schema_from_dicoms, dicom_file_to_parquet, snake_case};
 
     #[test]
     fn test_dicom_to_parquet_sopuid() {
@@ -835,7 +843,6 @@ mod tests {
         dicom_file_to_parquet(
             &dicom_file_path,
             parquet_file_path.path(),
-            true,
             true,
             None,
             false,
@@ -861,26 +868,15 @@ mod tests {
     #[rstest]
     #[case(false)]
     #[case(true)]
-    fn test_dicom_to_parquet_pixel_data(#[case] header_only: bool) {
-        // Get the expected PixelData from the DICOM
+    fn test_dicom_to_parquet_never_stores_pixel_data(#[case] hash_pixel_data: bool) {
         let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
-        let obj = OpenFileOptions::new()
-            .open_file(dicom_file_path.clone())
-            .unwrap();
-        let expected: Vec<u8> = obj
-            .element_by_name("PixelData")
-            .unwrap()
-            .value()
-            .to_multi_int()
-            .unwrap();
 
         // Convert to parquet
         let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
         dicom_file_to_parquet(
             &dicom_file_path,
             parquet_file_path.path(),
-            header_only,
-            true,
+            hash_pixel_data,
             None,
             false,
         )
@@ -891,36 +887,23 @@ mod tests {
         let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
         let mut reader = builder.build().unwrap();
 
-        // Check that the PixelData is correct
         let batch = reader.next().unwrap().unwrap();
-        match header_only {
-            true => {
-                // PixelData should not be present in the schema
-                let index = batch.schema().index_of("PixelData");
-                assert!(index.is_err());
-            }
-            false => {
-                // PixelData should be present in the schema
-                println!("{:?}", batch.schema());
-                let column = batch.column(batch.schema().index_of("PixelData").unwrap());
-                let pixel_data = column
-                    .as_any()
-                    .downcast_ref::<BinaryArray>()
-                    .unwrap()
-                    .value(0);
-                assert_eq!(*pixel_data, expected);
-
-                // PixelData hash should be present in the schema
-                let column = batch.column(batch.schema().index_of("PixelDataHash").unwrap());
-                let expected_hash = 10240938377863354873_u64;
-                let hash = column
-                    .as_any()
-                    .downcast_ref::<UInt64Array>()
-                    .unwrap()
-                    .value(0);
-                assert_eq!(hash, expected_hash);
-            }
-        };
+        assert!(
+            batch.schema().index_of("PixelData").is_err(),
+            "PixelData should never be present in metadata-only output",
+        );
+        if hash_pixel_data {
+            let column = batch.column(batch.schema().index_of("PixelDataHash").unwrap());
+            let expected_hash = 10240938377863354873_u64;
+            let hash = column
+                .as_any()
+                .downcast_ref::<UInt64Array>()
+                .unwrap()
+                .value(0);
+            assert_eq!(hash, expected_hash);
+        } else {
+            assert!(batch.schema().index_of("PixelDataHash").is_err());
+        }
     }
 
     #[test]
@@ -936,7 +919,6 @@ mod tests {
         dicom_file_to_parquet(
             &dicom_file_path,
             parquet_file_path.path(),
-            false,
             false,
             Some(&overrides),
             false,
@@ -970,7 +952,6 @@ mod tests {
             &dicom_file_path,
             parquet_file_path.path(),
             false,
-            false,
             None,
             false,
         )
@@ -998,11 +979,10 @@ mod tests {
         // Convert to parquet
         let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
         let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
-        let (header_only, hash_pixel_data) = (true, true);
+        let hash_pixel_data = true;
         dicom_file_to_parquet(
             &dicom_file_path,
             parquet_file_path.path(),
-            header_only,
             hash_pixel_data,
             None,
             false,
@@ -1018,7 +998,7 @@ mod tests {
         // PixelData shouldn't be in the output
         assert!(
             batch.schema().index_of("PixelData").is_err(),
-            "PixelData should not be present when header_only is true"
+            "PixelData should not be present in metadata-only output"
         );
 
         // But PixelData should have been hashed
@@ -1049,15 +1029,7 @@ mod tests {
         let dicom_file_path = dicom_test_files::path(dicom_file_name).unwrap();
         let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
         let parquet_file_path = parquet_file_path.path();
-        dicom_file_to_parquet(
-            &dicom_file_path,
-            parquet_file_path,
-            false,
-            true,
-            None,
-            false,
-        )
-        .unwrap();
+        dicom_file_to_parquet(&dicom_file_path, parquet_file_path, true, None, false).unwrap();
         assert!(parquet_file_path.is_file());
     }
 
@@ -1086,15 +1058,8 @@ mod tests {
 
         // Convert to parquet
         let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
-        dicom_file_to_parquet(
-            &dicom_file_path,
-            parquet_file_path.path(),
-            true,
-            true,
-            None,
-            true,
-        )
-        .unwrap();
+        dicom_file_to_parquet(&dicom_file_path, parquet_file_path.path(), true, None, true)
+            .unwrap();
 
         // Read parquet
         let parquet_file = File::open(parquet_file_path).unwrap();
@@ -1120,5 +1085,20 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
+    fn test_create_unified_schema_strict_mode() {
+        let temp = tempfile::tempdir().unwrap();
+        let invalid = temp.path().join("invalid.dcm");
+        std::fs::write(&invalid, b"not a dicom").unwrap();
+        let valid = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        let paths = vec![valid, invalid];
+
+        let non_strict = create_unified_schema_from_dicoms(&paths, false, false, false);
+        assert!(non_strict.is_ok());
+
+        let strict = create_unified_schema_from_dicoms(&paths, false, false, true);
+        assert!(strict.is_err());
     }
 }
