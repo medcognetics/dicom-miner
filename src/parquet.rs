@@ -5,7 +5,7 @@ use arrow::compute::{cast, kernels::cast_utils::Parser};
 use arrow::datatypes::{DataType, Date64Type, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use dicom::core::dictionary::DataDictionaryEntry;
-use dicom::core::header::HasLength;
+use dicom::core::header::{HasLength, Tag};
 use dicom::core::value::{DataSetSequence, PixelFragmentSequence, PrimitiveValue};
 use dicom::core::DataElement;
 use dicom::core::DicomValue;
@@ -28,6 +28,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 pub type DicomElement = DataElement<InMemDicomObject>;
+
+#[inline]
+fn is_private_tag(tag: Tag) -> bool {
+    // DICOM private tags are identified by odd group numbers.
+    tag.group() % 2 == 1
+}
 
 /// Convert a DICOM tag name to snake case
 ///
@@ -527,7 +533,7 @@ pub fn extract_schema_from_dicom_header(
     for element in (&dicom).into_iter().chain(meta_elems.iter()) {
         let (header, value) = (&element.header(), element.value());
 
-        if value.is_empty() {
+        if value.is_empty() || is_private_tag(header.tag) {
             continue;
         }
 
@@ -628,15 +634,6 @@ pub fn create_unified_schema_from_dicoms(
             }
         })?;
     }
-
-    // Drop private tags (starting with '(')
-    let fields: Vec<Field> = unified_schema
-        .fields()
-        .iter()
-        .filter(|f: &&Arc<Field>| !f.name().starts_with("("))
-        .map(|f: &Arc<Field>| Field::new(f.name(), f.data_type().clone(), f.is_nullable()))
-        .collect();
-    let unified_schema = Schema::new(fields);
 
     // Convert all fields to UTF8 for compatibility (like collect-parquet)
     let fields: Vec<Field> = unified_schema
@@ -817,6 +814,7 @@ pub fn cast_record_to_utf8_schema(
 #[cfg(test)]
 mod tests {
     use arrow::array::{StringArray, UInt64Array};
+    use dicom::core::header::Tag;
     use dicom::object::OpenFileOptions;
     use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
     use rstest::rstest;
@@ -1085,6 +1083,12 @@ mod tests {
             .unwrap()
             .value(0);
         assert_eq!(hash, expected_hash);
+    }
+
+    #[test]
+    fn test_private_tag_detection_uses_group_parity() {
+        assert!(super::is_private_tag(Tag(0x0009, 0x1000)));
+        assert!(!super::is_private_tag(Tag(0x0008, 0x9999)));
     }
 
     #[test]

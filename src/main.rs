@@ -1,3 +1,4 @@
+use arrow::datatypes::{DataType, Field, Schema};
 use clap::{Parser, ValueEnum};
 use crossbeam_channel::{bounded, Receiver, Sender};
 use dicom::core::dictionary::DataDictionaryEntry;
@@ -7,6 +8,7 @@ use dicom::dictionary_std::StandardDataDictionary;
 use dicom_miner::dicom::{is_dicom_file, open_dicom};
 use dicom_miner::parquet::{
     cast_record_to_utf8_schema, create_unified_schema_from_dicoms, dicom_to_record_batch,
+    snake_case as dicom_tag_to_snake_case,
 };
 use indicatif::{ParallelProgressIterator, ProgressBar, ProgressStyle};
 use log::{debug, error, info, warn};
@@ -15,7 +17,7 @@ use parquet::basic::{Compression, ZstdLevel};
 use parquet::file::properties::WriterProperties;
 use rayon::prelude::*;
 use rust_search::SearchBuilder;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -137,6 +139,47 @@ fn resolve_tag_overrides(
         overrides.insert(tag, value.clone());
     }
     Ok(overrides)
+}
+
+fn tag_field_name(tag: Tag, snake_case: bool) -> String {
+    let name = StandardDataDictionary
+        .by_tag(tag)
+        .map_or_else(|| tag.to_string(), |entry| entry.alias().to_string());
+    if snake_case {
+        dicom_tag_to_snake_case(&name)
+    } else {
+        name
+    }
+}
+
+fn add_override_fields_to_schema(
+    schema: &Schema,
+    overrides: Option<&HashMap<Tag, String>>,
+    snake_case: bool,
+) -> Schema {
+    let Some(overrides) = overrides else {
+        return schema.clone();
+    };
+
+    let mut existing_names = schema
+        .fields()
+        .iter()
+        .map(|field| field.name().to_string())
+        .collect::<HashSet<_>>();
+    let mut fields = schema
+        .fields()
+        .iter()
+        .map(|field| Field::new(field.name(), field.data_type().clone(), field.is_nullable()))
+        .collect::<Vec<_>>();
+
+    for tag in overrides.keys() {
+        let field_name = tag_field_name(*tag, snake_case);
+        if existing_names.insert(field_name.clone()) {
+            fields.push(Field::new(field_name, DataType::Utf8, true));
+        }
+    }
+
+    Schema::new(fields)
 }
 
 fn convert_single_dicom(
@@ -433,8 +476,11 @@ fn run(args: Args) -> Result<RunSummary, AggregateError> {
 
     // Phase 2: Extract unified schema (parallel)
     info!("Extracting unified schema from DICOM headers...");
-    let unified_schema =
-        create_unified_schema_from_dicoms(&dicom_files, args.snake_case, args.hash, args.strict)?;
+    let unified_schema = add_override_fields_to_schema(
+        &create_unified_schema_from_dicoms(&dicom_files, args.snake_case, args.hash, args.strict)?,
+        overrides.as_ref(),
+        args.snake_case,
+    );
 
     info!(
         "Unified schema has {} fields",
@@ -520,7 +566,10 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{run, AggregateError, Args, SortMode};
+    use arrow::array::{Array, StringArray};
     use dicom_miner::error::Error as CoreError;
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    use std::fs::File;
 
     fn copy_fixture(temp_input: &tempfile::TempDir, fixture: &str) {
         let src = dicom_test_files::path(fixture).unwrap();
@@ -637,5 +686,50 @@ mod tests {
         };
 
         assert!(run(args).is_err());
+    }
+
+    #[test]
+    fn test_override_field_is_preserved_in_unified_schema() {
+        let temp_input = tempfile::tempdir().unwrap();
+        let temp_output = tempfile::tempdir().unwrap();
+        copy_fixture(&temp_input, "pydicom/SC_rgb.dcm");
+
+        let args = Args {
+            source_dir: temp_input.path().to_path_buf(),
+            output_path: temp_output.path().join("output.parquet"),
+            hash: false,
+            tags: vec![("DataSetName".to_string(), "dataset".to_string())],
+            strict: true,
+            snake_case: false,
+            shard_size: 128,
+            compression_level: 6,
+            sort: SortMode::None,
+        };
+
+        let summary = run(args).unwrap();
+        assert_eq!(summary.processed_files, 1);
+        assert!(!summary.shard_paths.is_empty());
+
+        let mut found_override = false;
+        for shard in &summary.shard_paths {
+            let file = File::open(shard).unwrap();
+            let builder = ParquetRecordBatchReaderBuilder::try_new(file).unwrap();
+            let reader = builder.build().unwrap();
+            for batch in reader {
+                let batch = batch.unwrap();
+                let index = batch.schema().index_of("DataSetName").unwrap();
+                let values = batch
+                    .column(index)
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .unwrap();
+                for i in 0..values.len() {
+                    assert_eq!(values.value(i), "dataset");
+                    found_override = true;
+                }
+            }
+        }
+
+        assert!(found_override, "Expected injected override value in output");
     }
 }
