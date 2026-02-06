@@ -1,0 +1,1127 @@
+use crate::dicom::open_dicom;
+use crate::error::Error;
+use arrow::array::*;
+use arrow::compute::{cast, kernels::cast_utils::Parser};
+use arrow::datatypes::{DataType, Date64Type, Field, Schema};
+use arrow::record_batch::RecordBatch;
+use dicom::core::dictionary::DataDictionaryEntry;
+use dicom::core::header::HasLength;
+use dicom::core::value::{DataSetSequence, PixelFragmentSequence, PrimitiveValue};
+use dicom::core::DataElement;
+use dicom::core::DicomValue;
+use dicom::core::{DataDictionary, VR};
+use dicom::dictionary_std::tags;
+use dicom::dictionary_std::StandardDataDictionary;
+use dicom::object::mem::InMemElement;
+use dicom::object::FileDicomObject;
+use dicom::object::InMemDicomObject;
+use dicom_json::DicomJson;
+use log::warn;
+use parquet::arrow::arrow_writer::ArrowWriter;
+use parquet::basic::Compression;
+use parquet::file::properties::WriterProperties;
+use rayon::prelude::*;
+use serde_json;
+use std::collections::HashMap;
+use std::fs::File;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+pub type DicomElement = DataElement<InMemDicomObject>;
+
+/// Convert a DICOM tag name to snake case
+///
+/// # Arguments
+///
+/// * `s` - A reference to a string
+///
+/// # Returns
+///
+/// * A string in snake case
+///
+/// # Examples
+///
+/// ```
+/// use dicom_miner::parquet::snake_case;
+/// let s = "SOPInstanceUID";
+/// let expected = "sop_instance_uid";
+/// let result = snake_case(s);
+/// assert_eq!(result, expected);
+///
+/// let s = "StudyInstanceUID";
+/// let expected = "study_instance_uid";
+/// let result = snake_case(s);
+/// assert_eq!(result, expected);
+/// ```
+pub fn snake_case(s: &str) -> String {
+    // This Regex works well and is much simpler, but lookaround is not currently supported
+    //let re = Regex::new(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])").unwrap();
+    let mut result = Vec::new();
+    let mut current = String::new();
+    let chars: Vec<char> = s.chars().collect();
+
+    current.push(chars[0]);
+
+    for i in 1..chars.len() {
+        if chars[i].is_uppercase()
+            && (chars[i - 1].is_lowercase() || (i < chars.len() - 1 && chars[i + 1].is_lowercase()))
+        {
+            result.push(current.clone());
+            current.clear();
+        }
+        current.push(chars[i]);
+    }
+
+    result.push(current);
+    result.join("_").to_lowercase()
+}
+
+pub trait ArrayWrap {
+    /// Wrap the array in a list array of length 1
+    fn wrap_as_list(&self) -> Self;
+}
+
+impl ArrayWrap for ArrayRef {
+    fn wrap_as_list(&self) -> Self {
+        let nested_field = Arc::new(Field::new("item", self.data_type().clone(), true));
+        let offsets = Int32Array::from(vec![0, self.len() as i32]);
+        let list_data = ArrayData::builder(DataType::List(nested_field))
+            .len(1)
+            .add_buffer(offsets.to_data().buffers()[0].clone())
+            .add_child_data(self.to_data())
+            .build()
+            .unwrap();
+        Arc::new(ListArray::from(list_data))
+    }
+}
+
+impl ArrayWrap for Field {
+    fn wrap_as_list(&self) -> Self {
+        let nested_field = Arc::new(Field::new("item", self.data_type().clone(), true));
+        Field::new(
+            self.name(),
+            DataType::List(nested_field),
+            self.is_nullable(),
+        )
+    }
+}
+
+trait FromDicom: Sized {
+    /// Create from a DICOM PrimitiveValue
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - A reference to a PrimitiveValue object
+    ///
+    /// # Returns
+    ///
+    /// * Converted value, or None if the value is empty
+    fn from_dicom_primitive(value: &PrimitiveValue) -> Option<Self>;
+
+    /// Create from a DICOM sequence
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - A reference to a DataSetSequence object
+    ///
+    /// # Returns
+    ///
+    /// * Converted value, or None if the sequence is empty
+    fn from_dicom_sequence(seq: &DataSetSequence<InMemDicomObject>) -> Option<Self>;
+
+    /// Create from a DICOM pixel sequence
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - A reference to a PixelFragmentSequence object
+    ///
+    /// # Returns
+    ///
+    /// * Converted value, or None if the sequence is empty
+    fn from_dicom_pixel_sequence(seq: &PixelFragmentSequence<Vec<u8>>) -> Option<Self>;
+
+    /// Create from a DICOM element
+    ///
+    /// # Arguments
+    ///
+    /// * `elem` - A reference to a DicomElement object
+    ///
+    /// # Returns
+    ///
+    /// * Converted value, or None if the element is of sequence type and the sequence is empty
+    fn from_dicom_element(elem: &DicomElement) -> Option<Self>;
+}
+
+impl FromDicom for DataType {
+    fn from_dicom_primitive(value: &PrimitiveValue) -> Option<DataType> {
+        // For multiplicity > 1, we will convert the contents to string
+        if value.multiplicity() > 1 {
+            return Some(DataType::Utf8);
+        } else if value.is_empty() {
+            return None;
+        }
+        // https://dicom.nema.org/dicom/2013/output/chtml/part05/sect_6.2.html
+        Some(match value {
+            PrimitiveValue::Date(_) => DataType::Date64, // 128 bits per DICOM standard, Arrow max is 64
+            PrimitiveValue::U8(_) => DataType::UInt8,
+            PrimitiveValue::U16(_) => DataType::UInt16,
+            PrimitiveValue::I16(_) => DataType::Int16,
+            PrimitiveValue::U32(_) => DataType::UInt32,
+            PrimitiveValue::I32(_) => DataType::Int32,
+            PrimitiveValue::F32(_) => DataType::Float32,
+            PrimitiveValue::U64(_) => DataType::UInt64,
+            PrimitiveValue::I64(_) => DataType::Int64,
+            PrimitiveValue::F64(_) => DataType::Float64,
+            PrimitiveValue::Strs(_) => DataType::Utf8,
+            PrimitiveValue::Str(_) => DataType::Utf8,
+            _ => DataType::Utf8,
+        })
+    }
+
+    fn from_dicom_sequence(seq: &DataSetSequence<InMemDicomObject>) -> Option<Self> {
+        // Sequences can be nested so we will flatten them to string
+        match seq.is_empty() {
+            true => None,
+            false => Some(DataType::Utf8),
+        }
+    }
+
+    fn from_dicom_pixel_sequence(pixels: &PixelFragmentSequence<Vec<u8>>) -> Option<Self> {
+        match pixels.is_empty() {
+            true => None,
+            false => Some(DataType::Binary),
+        }
+    }
+
+    fn from_dicom_element(elem: &DicomElement) -> Option<Self> {
+        // Sometimes PixelData is not a PixelSequence, so catch it manually and force to binary
+        if elem.header().tag == tags::PIXEL_DATA {
+            return Some(DataType::Binary).filter(|_| !elem.value().is_empty());
+        }
+        match elem.value() {
+            DicomValue::Primitive(v) => Self::from_dicom_primitive(v),
+            DicomValue::Sequence(v) => Self::from_dicom_sequence(v),
+            DicomValue::PixelSequence(v) => Self::from_dicom_pixel_sequence(v),
+        }
+    }
+}
+
+impl FromDicom for ArrayRef {
+    fn from_dicom_primitive(value: &PrimitiveValue) -> Option<ArrayRef> {
+        // For multiplicity > 1, we will convert the contents to string
+        if value.multiplicity() > 1 {
+            return Some(Arc::new(StringArray::from(vec![value.to_string()])));
+        } else if value.is_empty() {
+            return None;
+        }
+        Some(match value {
+            PrimitiveValue::Date(f) => Arc::new(Date64Array::from(
+                f.iter()
+                    .map(|x| {
+                        Date64Type::parse(&format!(
+                            "{:04}-{:02}-{:02}",
+                            x.year(),
+                            x.month().unwrap_or(&0),
+                            x.day().unwrap_or(&0)
+                        ))
+                    })
+                    .collect::<Vec<_>>(),
+            )),
+            PrimitiveValue::U8(f) => Arc::new(UInt8Array::from(f.to_vec())),
+            PrimitiveValue::U16(f) => Arc::new(UInt16Array::from(f.to_vec())),
+            PrimitiveValue::I16(f) => Arc::new(Int16Array::from(f.to_vec())),
+            PrimitiveValue::U32(f) => Arc::new(UInt32Array::from(f.to_vec())),
+            PrimitiveValue::I32(f) => Arc::new(Int32Array::from(f.to_vec())),
+            PrimitiveValue::F32(f) => Arc::new(Float32Array::from(f.to_vec())),
+            PrimitiveValue::U64(f) => Arc::new(UInt64Array::from(f.to_vec())),
+            PrimitiveValue::I64(f) => Arc::new(Int64Array::from(f.to_vec())),
+            PrimitiveValue::F64(f) => Arc::new(Float64Array::from(f.to_vec())),
+            PrimitiveValue::Strs(f) => Arc::new(StringArray::from(f.to_vec())),
+            PrimitiveValue::Str(f) => Arc::new(StringArray::from(vec![f.as_str()])),
+            f => Arc::new(StringArray::from(vec![f.to_string()])),
+        })
+    }
+
+    fn from_dicom_sequence(seq: &DataSetSequence<InMemDicomObject>) -> Option<ArrayRef> {
+        if seq.is_empty() {
+            return None;
+        }
+
+        // Convert each sequence element to a JSON string
+        let sub_jsons = seq
+            .items()
+            .into_iter()
+            .map(DicomJson::from)
+            .filter_map(|x| serde_json::to_value(&x).ok())
+            .map(|x| x.to_string())
+            .collect::<Vec<_>>();
+
+        match serde_json::to_value(sub_jsons) {
+            Ok(v) => Some(Arc::new(StringArray::from(vec![v.to_string()]))),
+            Err(_) => None,
+        }
+    }
+
+    fn from_dicom_pixel_sequence(pixels: &PixelFragmentSequence<Vec<u8>>) -> Option<Self> {
+        match pixels.is_empty() {
+            true => None,
+            false => {
+                // Read the offset table and fragments and flatten them into a stream
+                let offset_table = pixels.offset_table().iter().flat_map(|x| x.to_le_bytes());
+                let fragments = pixels.fragments().iter().flatten().copied();
+                let raw_data = offset_table.chain(fragments).collect::<Vec<u8>>();
+                Some(Arc::new(BinaryArray::from(vec![raw_data.as_slice()])))
+            }
+        }
+    }
+
+    fn from_dicom_element(elem: &DicomElement) -> Option<ArrayRef> {
+        match (elem.header().tag, elem.value()) {
+            // Sometimes PixelData is not a PixelSequence, so catch it manually and force to binary
+            (tags::PIXEL_DATA, DicomValue::Primitive(p)) => match p.is_empty() {
+                true => None,
+                false => Some(Arc::new(BinaryArray::from(vec![p.to_bytes().as_ref()]))),
+            },
+            (_, DicomValue::PixelSequence(v)) => Self::from_dicom_pixel_sequence(v),
+            (_, DicomValue::Sequence(v)) => Self::from_dicom_sequence(v),
+            (_, DicomValue::Primitive(v)) => Self::from_dicom_primitive(v),
+        }
+    }
+}
+
+/// Hashes pixel data if required and writes DICOM data to a Parquet file.
+///
+/// This function reads a DICOM file from the specified `dicom_path`, extracts its metadata and data,
+/// and writes it to a Parquet file at the specified `parquet_path`. If `header_only` is set to true,
+/// only the metadata (header) of the DICOM file is written to the Parquet file. Otherwise, both the
+/// metadata and the data are written.
+///
+/// # Arguments
+///
+/// * `dicom_path` - Path to the input DICOM file.
+/// * `parquet_path` - Path to the output Parquet file.
+/// * `header_only` - Boolean flag indicating whether to write only the metadata (header) or both metadata and data.
+/// * `hash_pixel_data` - Boolean flag indicating whether to hash the pixel data.
+/// * `overrides` - Optional hash map of tag names to values to override the original DICOM data.
+///
+/// # Returns
+///
+/// * `Result<(), Error>` - Ok if the operation is successful, otherwise an Error.
+///
+/// # Errors
+///
+/// This function will return an error if the DICOM file cannot be read, if the Parquet file cannot be written,
+/// or if there is an issue with the DICOM or Parquet schema.
+pub fn dicom_file_to_parquet(
+    dicom_path: &Path,
+    parquet_path: &Path,
+    header_only: bool,
+    hash_pixel_data: bool,
+    overrides: Option<&HashMap<String, String>>,
+    snake_case: bool,
+) -> Result<(), Error> {
+    let mut obj =
+        open_dicom(dicom_path, header_only && !hash_pixel_data).map_err(|e| Error::Whatever {
+            message: format!("Failed to open DICOM file: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+
+    // Add each tag string and value string to the DICOM
+    if overrides.is_some() {
+        for (tag, value) in overrides.unwrap() {
+            // Map string tag to a tag enum
+            let tag = StandardDataDictionary::default()
+                .by_name(tag)
+                .ok_or(Error::TagNotFound {
+                    tag_name: tag.to_string(),
+                })?
+                .tag();
+
+            // Create DICOM element and inject value
+            let element = DataElement::new(tag, VR::LO, value.to_string());
+            obj.put(element);
+        }
+    }
+
+    dicom_to_parquet(&obj, parquet_path, header_only, hash_pixel_data, snake_case)
+}
+
+/// Hashes pixel data if required and writes DICOM data to a Parquet file.
+///
+/// This function processes the DICOM data provided, optionally hashes pixel data if specified,
+/// and writes the resulting data to a Parquet file. It handles both cases where only metadata
+/// is required or both metadata and pixel data are needed.
+///
+/// # Arguments
+///
+/// * `dicom` - A reference to the in-memory DICOM object.
+/// * `parquet_path` - The file path where the Parquet file will be saved.
+/// * `header_only` - If true, only DICOM headers are processed; otherwise, full data is processed.
+/// * `hash_pixel_data` - If true, pixel data is hashed for additional processing.
+/// * `snake_case` - If true, DICOM tag names are converted to snake case.
+///
+/// # Returns
+///
+/// * `Result<(), Error>` - Result indicating the success or failure of the operation.
+///
+/// # Errors
+///
+/// This function will return an error if there is an issue with reading the DICOM data,
+/// processing the pixel data, or writing to the Parquet file.
+pub fn dicom_to_parquet(
+    dicom: &FileDicomObject<InMemDicomObject>,
+    parquet_path: &Path,
+    header_only: bool,
+    hash_pixel_data: bool,
+    snake_case: bool,
+) -> Result<(), Error> {
+    // Allocate containers to hold Parquet fields and arrays
+    let mut fields = vec![];
+    let mut arrays: Vec<ArrayRef> = vec![];
+
+    // Extract metadata header elements and make them compatible with the rest of the data
+    let meta_elems = dicom
+        .meta()
+        .to_element_iter()
+        .map(|e| e.into_parts())
+        .filter_map(|(header, value)| match value.into_primitive() {
+            Some(v) => Some(InMemElement::new(header.tag, header.vr(), v)),
+            None => None,
+        })
+        .collect::<Vec<_>>();
+
+    // Loop through header and body tags and add to schema / arrays
+    let elements = dicom.into_iter().chain(meta_elems.iter());
+    for element in elements {
+        let (header, value) = (&element.header(), element.value());
+        if value.is_empty() || (header_only && header.tag == tags::PIXEL_DATA) {
+            continue;
+        }
+
+        let tag_name = StandardDataDictionary
+            .by_tag(header.tag)
+            .map_or_else(|| header.tag.to_string(), |t| t.alias().to_string());
+
+        // Convert to snake case
+        let tag_name = match snake_case {
+            true => self::snake_case(&tag_name),
+            false => tag_name,
+        };
+
+        let nullable =
+            header.tag != tags::SOP_INSTANCE_UID && header.tag != tags::STUDY_INSTANCE_UID;
+
+        let field = DataType::from_dicom_element(element)
+            .and_then(|dtype| Some(Field::new(tag_name, dtype, nullable)));
+        let array = ArrayRef::from_dicom_element(element);
+
+        match (field, array) {
+            (Some(f), Some(a)) => {
+                fields.push(f);
+                arrays.push(a);
+            }
+            _ => {}
+        }
+    }
+
+    // Hash the pixel data if requested
+    if hash_pixel_data {
+        // Check if the pixel data is present
+        let has_pixel_data = dicom
+            .element_opt(tags::PIXEL_DATA)
+            .unwrap_or(None)
+            .is_some_and(|v| !v.is_empty());
+
+        // Add the hashed pixel data to the schema and arrays
+        if has_pixel_data {
+            let hash_tag_name = match snake_case {
+                true => "pixel_data_hash".to_string(),
+                false => "PixelDataHash".to_string(),
+            };
+            let hashed_pixel_data =
+                crate::dicom::hash_pixel_data(dicom).map_err(|_| Error::PixelHashError)?;
+            fields.push(Field::new(hash_tag_name, DataType::UInt64, true));
+            arrays.push(Arc::new(UInt64Array::from(vec![hashed_pixel_data])) as ArrayRef);
+        }
+    }
+
+    fields.iter().zip(arrays.iter()).for_each(|(field, array)| {
+        assert!(
+            array.len() == 1,
+            "Array {} should have length 1, found {}",
+            field.name(),
+            array.len()
+        );
+    });
+
+    // Create schema
+    let schema = Arc::new(Schema::new(fields));
+
+    // Set compression to SNAPPY
+    let props = WriterProperties::builder()
+        .set_compression(Compression::SNAPPY)
+        .build();
+
+    // Setup the writer
+    let file = File::create(parquet_path).map_err(|e| Error::Whatever {
+        message: format!("Error while creating file: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+    let mut arrow_writer =
+        ArrowWriter::try_new(file, schema.clone(), Some(props)).map_err(|e| Error::Whatever {
+            message: format!("Error while creating writer: {}", e),
+            source: Some(Box::new(e)),
+        })?;
+
+    // Set up the batch to write
+    let batch = RecordBatch::try_new(schema, arrays).map_err(|e| Error::Whatever {
+        message: format!("Error while creating batch: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+
+    // Run write op
+    arrow_writer.write(&batch).map_err(|e| Error::Whatever {
+        message: format!("Error while writing batch: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+    arrow_writer.close().map_err(|e| Error::Whatever {
+        message: format!("Error while closing writer: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+    Ok(())
+}
+
+/// Extract Arrow schema from DICOM header without creating arrays.
+/// This is significantly faster than full conversion since we only read metadata.
+///
+/// # Arguments
+///
+/// * `dicom_path` - Path to the input DICOM file
+/// * `snake_case` - Convert DICOM tag names to snake_case
+/// * `hash_pixel_data` - Include PixelDataHash field in schema
+///
+/// # Returns
+///
+/// * `Result<Schema, Error>` - Arrow schema extracted from DICOM headers
+pub fn extract_schema_from_dicom_header(
+    dicom_path: &Path,
+    snake_case: bool,
+    hash_pixel_data: bool,
+) -> Result<Schema, Error> {
+    // Open DICOM in header-only mode (stops at PixelData tag)
+    let dicom = open_dicom(dicom_path, true).map_err(|e| Error::Whatever {
+        message: format!("Failed to open DICOM file: {}", e),
+        source: Some(Box::new(e)),
+    })?;
+
+    let mut fields = vec![];
+
+    // Extract metadata header elements and make them compatible with the rest of the data
+    let meta_elems = dicom
+        .meta()
+        .to_element_iter()
+        .map(|e| e.into_parts())
+        .filter_map(|(header, value)| match value.into_primitive() {
+            Some(v) => Some(InMemElement::new(header.tag, header.vr(), v)),
+            None => None,
+        })
+        .collect::<Vec<_>>();
+
+    // Loop through header and body tags and extract schema
+    for element in (&dicom).into_iter().chain(meta_elems.iter()) {
+        let (header, value) = (&element.header(), element.value());
+
+        if value.is_empty() {
+            continue;
+        }
+
+        let tag_name = StandardDataDictionary
+            .by_tag(header.tag)
+            .map_or_else(|| header.tag.to_string(), |t| t.alias().to_string());
+
+        // Convert to snake case if requested
+        let tag_name = if snake_case {
+            self::snake_case(&tag_name)
+        } else {
+            tag_name
+        };
+
+        let nullable =
+            header.tag != tags::SOP_INSTANCE_UID && header.tag != tags::STUDY_INSTANCE_UID;
+
+        // Use FromDicom trait to get DataType WITHOUT creating arrays
+        if let Some(dtype) = DataType::from_dicom_element(&element) {
+            fields.push(Field::new(tag_name, dtype, nullable));
+        }
+    }
+
+    // Add PixelDataHash field if requested
+    if hash_pixel_data {
+        let hash_tag_name = if snake_case {
+            "pixel_data_hash".to_string()
+        } else {
+            "PixelDataHash".to_string()
+        };
+        fields.push(Field::new(hash_tag_name, DataType::UInt64, true));
+    }
+
+    Ok(Schema::new(fields))
+}
+
+/// Create a unified schema from multiple DICOM files with UTF8 normalization.
+/// This function extracts schemas from all DICOM files in parallel, then merges
+/// them into a single unified schema with all fields converted to UTF8.
+///
+/// # Arguments
+///
+/// * `dicom_paths` - Slice of paths to DICOM files
+/// * `snake_case` - Convert DICOM tag names to snake_case
+/// * `hash_pixel_data` - Include PixelDataHash field in schema
+///
+/// # Returns
+///
+/// * `Result<Schema, Error>` - Unified Arrow schema with UTF8 fields
+pub fn create_unified_schema_from_dicoms(
+    dicom_paths: &[PathBuf],
+    snake_case: bool,
+    hash_pixel_data: bool,
+) -> Result<Schema, Error> {
+    if dicom_paths.is_empty() {
+        return Err(Error::Whatever {
+            message: "No DICOM files found".to_string(),
+            source: None,
+        });
+    }
+
+    // Parallel schema extraction from DICOM headers
+    let schemas: Vec<Schema> = dicom_paths
+        .par_iter()
+        .filter_map(|path| {
+            match extract_schema_from_dicom_header(path, snake_case, hash_pixel_data) {
+                Ok(s) => Some(s),
+                Err(e) => {
+                    warn!("Failed to extract schema from {}: {}", path.display(), e);
+                    None
+                }
+            }
+        })
+        .collect();
+
+    if schemas.is_empty() {
+        return Err(Error::Whatever {
+            message: "Failed to extract schemas from all DICOM files".to_string(),
+            source: None,
+        });
+    }
+
+    // Sequential merge of schemas (Arrow limitation)
+    let mut unified_schema: Schema = schemas[0].clone();
+    for schema in schemas.iter().skip(1) {
+        unified_schema = Schema::try_merge(vec![unified_schema, schema.clone()]).map_err(|e| {
+            Error::Whatever {
+                message: format!("Schema merge failed: {}", e),
+                source: Some(Box::new(e)),
+            }
+        })?;
+    }
+
+    // Drop private tags (starting with '(')
+    let fields: Vec<Field> = unified_schema
+        .fields()
+        .iter()
+        .filter(|f: &&Arc<Field>| !f.name().starts_with("("))
+        .map(|f: &Arc<Field>| Field::new(f.name(), f.data_type().clone(), f.is_nullable()))
+        .collect();
+    let unified_schema = Schema::new(fields);
+
+    // Convert all fields to UTF8 for compatibility (like collect-parquet)
+    let fields: Vec<Field> = unified_schema
+        .fields()
+        .iter()
+        .map(|f: &Arc<Field>| Field::new(f.name(), DataType::Utf8, f.is_nullable()))
+        .collect();
+
+    Ok(Schema::new(fields))
+}
+
+/// Convert a DICOM file to a single-row Arrow RecordBatch (in-memory, no file write).
+/// This is similar to dicom_to_parquet but returns the data as a RecordBatch instead of writing to a file.
+///
+/// # Arguments
+///
+/// * `dicom` - Reference to the in-memory DICOM object
+/// * `header_only` - If true, only DICOM headers are processed; otherwise, full data is processed
+/// * `hash_pixel_data` - If true, pixel data is hashed for additional processing
+/// * `snake_case` - If true, DICOM tag names are converted to snake case
+///
+/// # Returns
+///
+/// * `Result<RecordBatch, Error>` - Single-row RecordBatch containing DICOM data
+pub fn dicom_to_record_batch(
+    dicom: &FileDicomObject<InMemDicomObject>,
+    header_only: bool,
+    hash_pixel_data: bool,
+    snake_case: bool,
+) -> Result<RecordBatch, Error> {
+    // Allocate containers to hold Parquet fields and arrays
+    let mut fields = vec![];
+    let mut arrays: Vec<ArrayRef> = vec![];
+
+    // Extract metadata header elements and make them compatible with the rest of the data
+    let meta_elems = dicom
+        .meta()
+        .to_element_iter()
+        .map(|e| e.into_parts())
+        .filter_map(|(header, value)| match value.into_primitive() {
+            Some(v) => Some(InMemElement::new(header.tag, header.vr(), v)),
+            None => None,
+        })
+        .collect::<Vec<_>>();
+
+    // Loop through header and body tags and add to schema / arrays
+    let elements = dicom.into_iter().chain(meta_elems.iter());
+    for element in elements {
+        let (header, value) = (&element.header(), element.value());
+        if value.is_empty() || (header_only && header.tag == tags::PIXEL_DATA) {
+            continue;
+        }
+
+        let tag_name = StandardDataDictionary
+            .by_tag(header.tag)
+            .map_or_else(|| header.tag.to_string(), |t| t.alias().to_string());
+
+        // Convert to snake case
+        let tag_name = match snake_case {
+            true => self::snake_case(&tag_name),
+            false => tag_name,
+        };
+
+        let nullable =
+            header.tag != tags::SOP_INSTANCE_UID && header.tag != tags::STUDY_INSTANCE_UID;
+
+        let field = DataType::from_dicom_element(element)
+            .and_then(|dtype| Some(Field::new(tag_name, dtype, nullable)));
+        let array = ArrayRef::from_dicom_element(element);
+
+        match (field, array) {
+            (Some(f), Some(a)) => {
+                fields.push(f);
+                arrays.push(a);
+            }
+            _ => {}
+        }
+    }
+
+    // Hash the pixel data if requested
+    if hash_pixel_data {
+        // Check if the pixel data is present
+        let has_pixel_data = dicom
+            .element_opt(tags::PIXEL_DATA)
+            .unwrap_or(None)
+            .is_some_and(|v| !v.is_empty());
+
+        // Add the hashed pixel data to the schema and arrays
+        if has_pixel_data {
+            let hash_tag_name = match snake_case {
+                true => "pixel_data_hash".to_string(),
+                false => "PixelDataHash".to_string(),
+            };
+            let hashed_pixel_data =
+                crate::dicom::hash_pixel_data(dicom).map_err(|_| Error::PixelHashError)?;
+            fields.push(Field::new(hash_tag_name, DataType::UInt64, true));
+            arrays.push(Arc::new(UInt64Array::from(vec![hashed_pixel_data])) as ArrayRef);
+        }
+    }
+
+    fields.iter().zip(arrays.iter()).for_each(|(field, array)| {
+        assert!(
+            array.len() == 1,
+            "Array {} should have length 1, found {}",
+            field.name(),
+            array.len()
+        );
+    });
+
+    // Create schema and RecordBatch
+    let schema = Arc::new(Schema::new(fields));
+    RecordBatch::try_new(schema, arrays).map_err(|e| Error::Whatever {
+        message: format!("Error while creating batch: {}", e),
+        source: Some(Box::new(e)),
+    })
+}
+
+/// Cast a record batch to the unified UTF8 schema.
+/// This function takes a RecordBatch and casts all columns to match the unified schema,
+/// creating null arrays for any missing columns.
+///
+/// # Arguments
+///
+/// * `record` - The RecordBatch to cast
+/// * `schema` - The target unified schema (all fields should be UTF8)
+///
+/// # Returns
+///
+/// * `Result<RecordBatch, Error>` - RecordBatch with columns cast to match the schema
+pub fn cast_record_to_utf8_schema(
+    record: &RecordBatch,
+    schema: &Schema,
+) -> Result<RecordBatch, Error> {
+    // Cast every column in record to match the schema
+    let casted_columns = schema
+        .fields()
+        .iter()
+        .map(|f| {
+            match record.schema().index_of(f.name()) {
+                // If the column exists, cast it to the correct type
+                Ok(i) => {
+                    let input = record.column(i);
+                    let target = f.data_type();
+                    cast(input, target).map_err(|e| Error::Whatever {
+                        message: format!("Failed to cast column {}: {}", f.name(), e),
+                        source: Some(Box::new(e)),
+                    })
+                }
+                // Otherwise create a null array of the correct type
+                _ => Ok(arrow::array::new_null_array(
+                    f.data_type(),
+                    record.num_rows() as usize,
+                )),
+            }
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    assert!(
+        casted_columns.len() == schema.fields().len(),
+        "Casted column count {} should match schema column count: {}",
+        casted_columns.len(),
+        schema.fields().len()
+    );
+
+    let batch = RecordBatch::try_new(Arc::new(schema.clone()), casted_columns).map_err(|e| {
+        Error::Whatever {
+            message: format!("Failed to create batch: {}", e),
+            source: Some(Box::new(e)),
+        }
+    })?;
+    Ok(batch)
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow::array::{BinaryArray, StringArray, UInt64Array};
+
+    use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+
+    use dicom::object::OpenFileOptions;
+    use rstest::rstest;
+    use std::collections::HashMap;
+
+    use super::{dicom_file_to_parquet, snake_case};
+
+    use std::fs::File;
+
+    #[test]
+    fn test_dicom_to_parquet_sopuid() {
+        // Get the expected SOPInstanceUID from the DICOM
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        let obj = OpenFileOptions::new()
+            .open_file(dicom_file_path.clone())
+            .unwrap();
+        let expected = obj
+            .element_by_name("SOPInstanceUID")
+            .unwrap()
+            .value()
+            .to_str();
+
+        // Convert to parquet
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            true,
+            true,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Read parquet
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+
+        // Check that the SOPInstanceUID is correct
+        let batch = reader.next().unwrap().unwrap();
+        let column = batch.column(batch.schema().index_of("SOPInstanceUID").unwrap());
+        let sop_instance_uid = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(sop_instance_uid, expected.unwrap());
+    }
+
+    #[rstest]
+    #[case(false)]
+    #[case(true)]
+    fn test_dicom_to_parquet_pixel_data(#[case] header_only: bool) {
+        // Get the expected PixelData from the DICOM
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        let obj = OpenFileOptions::new()
+            .open_file(dicom_file_path.clone())
+            .unwrap();
+        let expected: Vec<u8> = obj
+            .element_by_name("PixelData")
+            .unwrap()
+            .value()
+            .to_multi_int()
+            .unwrap();
+
+        // Convert to parquet
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            header_only,
+            true,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Read parquet
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+
+        // Check that the PixelData is correct
+        let batch = reader.next().unwrap().unwrap();
+        match header_only {
+            true => {
+                // PixelData should not be present in the schema
+                let index = batch.schema().index_of("PixelData");
+                assert!(index.is_err());
+            }
+            false => {
+                // PixelData should be present in the schema
+                println!("{:?}", batch.schema());
+                let column = batch.column(batch.schema().index_of("PixelData").unwrap());
+                let pixel_data = column
+                    .as_any()
+                    .downcast_ref::<BinaryArray>()
+                    .unwrap()
+                    .value(0);
+                assert_eq!(*pixel_data, expected);
+
+                // PixelData hash should be present in the schema
+                let column = batch.column(batch.schema().index_of("PixelDataHash").unwrap());
+                let expected_hash = 10240938377863354873_u64;
+                let hash = column
+                    .as_any()
+                    .downcast_ref::<UInt64Array>()
+                    .unwrap()
+                    .value(0);
+                assert_eq!(hash, expected_hash);
+            }
+        };
+    }
+
+    #[test]
+    fn test_dicom_file_to_parquet_with_tag_injection() {
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+
+        // Prepare the overrides with the new tag
+        let mut overrides = HashMap::new();
+        overrides.insert("DataSetName".to_string(), "dataset".to_string());
+
+        // Convert to parquet
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            false,
+            false,
+            Some(&overrides),
+            false,
+        )
+        .unwrap();
+
+        // Read the parquet file and verify the injected tag
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // Check that the DataSetName is present and correct
+        let index = batch.schema().index_of("DataSetName").unwrap();
+        let column = batch.column(index);
+        let data_set_name = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(data_set_name, "dataset");
+    }
+
+    #[test]
+    fn test_dicom_file_to_parquet_file_meta() {
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+
+        // Convert to parquet
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            false,
+            false,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Read the parquet file and verify TransferSyntaxUID
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // Check that the DataSetName is present and correct
+        let index = batch.schema().index_of("TransferSyntaxUID").unwrap();
+        let column = batch.column(index);
+        let tsuid = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(tsuid, "1.2.840.10008.1.2.1\0");
+    }
+
+    #[test]
+    fn test_hash_but_not_store_pixels() {
+        // Convert to parquet
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        let (header_only, hash_pixel_data) = (true, true);
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            header_only,
+            hash_pixel_data,
+            None,
+            false,
+        )
+        .unwrap();
+
+        // Read parquet
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // PixelData shouldn't be in the output
+        assert!(
+            batch.schema().index_of("PixelData").is_err(),
+            "PixelData should not be present when header_only is true"
+        );
+
+        // But PixelData should have been hashed
+        let column = batch.column(batch.schema().index_of("PixelDataHash").unwrap());
+        let expected_hash = 10240938377863354873_u64;
+        let hash = column
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(hash, expected_hash);
+    }
+
+    #[rstest]
+    #[case("pydicom/SC_rgb.dcm")]
+    #[case("pydicom/CT_small.dcm")]
+    #[case("pydicom/vlut_04.dcm")]
+    #[case("pydicom/JPEG-LL.dcm")]
+    #[case("pydicom/JPEG2000_UNC.dcm")]
+    #[case("pydicom/MR-SIEMENS-DICOM-WithOverlays.dcm")]
+    #[case("pydicom/MR2_J2KI.dcm")]
+    #[case("pydicom/US1_UNCR.dcm")]
+    #[case("pydicom/emri_small_RLE.dcm")]
+    #[case("pydicom/bad_sequence.dcm")]
+    #[case("pydicom/SC_rgb_expb_32bit_2frame.dcm")]
+    #[case("pydicom/693_J2KR.dcm")]
+    fn test_convert_various_files(#[case] dicom_file_name: &str) {
+        let dicom_file_path = dicom_test_files::path(dicom_file_name).unwrap();
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        let parquet_file_path = parquet_file_path.path();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path,
+            false,
+            true,
+            None,
+            false,
+        )
+        .unwrap();
+        assert!(parquet_file_path.is_file());
+    }
+
+    #[rstest]
+    #[case("SOPInstanceUID", "sop_instance_uid")]
+    #[case("StudyInstanceUID", "study_instance_uid")]
+    #[case("TransferSyntaxUID", "transfer_syntax_uid")]
+    #[case("FrameOfReferenceUID", "frame_of_reference_uid")]
+    #[case("ThisUIDString", "this_uid_string")]
+    fn test_snake_case(#[case] input: &str, #[case] expected: &str) {
+        let result = snake_case(input);
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_snake_case_conversion() {
+        let dicom_file_path = dicom_test_files::path("pydicom/SC_rgb.dcm").unwrap();
+        let obj = OpenFileOptions::new()
+            .open_file(dicom_file_path.clone())
+            .unwrap();
+        let expected = obj
+            .element_by_name("SOPInstanceUID")
+            .unwrap()
+            .value()
+            .to_str();
+
+        // Convert to parquet
+        let parquet_file_path = tempfile::NamedTempFile::new().unwrap();
+        dicom_file_to_parquet(
+            &dicom_file_path,
+            parquet_file_path.path(),
+            true,
+            true,
+            None,
+            true,
+        )
+        .unwrap();
+
+        // Read parquet
+        let parquet_file = File::open(parquet_file_path).unwrap();
+        let builder = ParquetRecordBatchReaderBuilder::try_new(parquet_file).unwrap();
+        let mut reader = builder.build().unwrap();
+        let batch = reader.next().unwrap().unwrap();
+
+        // Check SOPInstanceUID
+        let column = batch.column(batch.schema().index_of("sop_instance_uid").unwrap());
+        let sop_instance_uid = column
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap()
+            .value(0);
+        assert_eq!(sop_instance_uid, expected.unwrap());
+
+        // Test PixelDataHash
+        let column = batch.column(batch.schema().index_of("pixel_data_hash").unwrap());
+        let expected_hash = 10240938377863354873_u64;
+        let hash = column
+            .as_any()
+            .downcast_ref::<UInt64Array>()
+            .unwrap()
+            .value(0);
+        assert_eq!(hash, expected_hash);
+    }
+}
